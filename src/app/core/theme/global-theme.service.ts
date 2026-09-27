@@ -28,13 +28,17 @@ import { MatIconRegistry } from '@angular/material/icon';
 import { DomSanitizer } from '@angular/platform-browser';
 import { ChromeExtensionInterfaceService } from '../chrome-extension-interface/chrome-extension-interface.service';
 
+// eslint-disable-next-line @typescript-eslint/no-restricted-imports -- grandfathered layer-boundary debt
 import { GlobalConfigService } from '../../features/config/global-config.service';
+// eslint-disable-next-line @typescript-eslint/no-restricted-imports -- grandfathered layer-boundary debt
 import { WorkContextThemeCfg } from '../../features/work-context/work-context.model';
+// eslint-disable-next-line @typescript-eslint/no-restricted-imports -- grandfathered layer-boundary debt
 import {
   DEFAULT_BACKGROUND_OVERLAY_OPACITY,
   isBackgroundImageSet,
   normalizeBackgroundImageBlur,
 } from '../../features/work-context/work-context.const';
+// eslint-disable-next-line @typescript-eslint/no-restricted-imports -- grandfathered layer-boundary debt
 import { WorkContextService } from '../../features/work-context/work-context.service';
 import { combineLatest, fromEvent, Observable, of } from 'rxjs';
 import { IS_FIREFOX } from '../../util/is-firefox';
@@ -49,18 +53,23 @@ import { InputIntentService } from '../input-intent/input-intent.service';
 import { ipcEnterFullScreen$, ipcLeaveFullScreen$ } from '../ipc-events';
 
 import { IS_ANDROID_WEB_VIEW } from '../../util/is-android-web-view';
+// eslint-disable-next-line @typescript-eslint/no-restricted-imports -- grandfathered layer-boundary debt
 import { androidInterface } from '../../features/android/android-interface';
 import { HttpClient } from '@angular/common/http';
 import { CapacitorPlatformService } from '../platform/capacitor-platform.service';
-import { Keyboard, KeyboardInfo } from '@capacitor/keyboard';
-import { PluginListenerHandle, registerPlugin } from '@capacitor/core';
+import { registerPlugin } from '@capacitor/core';
 import { StatusBar, Style } from '@capacitor/status-bar';
 import { SafeArea } from 'capacitor-plugin-safe-area';
-import { FlexibleConnectedPositionStrategy } from '@angular/cdk/overlay';
+import { patchCdkViewportForSafeArea } from './cdk-safe-area-viewport.util';
+import { lockViewportZoom } from './lock-viewport-zoom.util';
 import { LS } from '../persistence/storage-keys.const';
-import { Log } from '../log';
+import { Log, PluginLog } from '../log';
 import { LayoutService } from '../../core-ui/layout/layout.service';
-import { sanitizeIosKeyboardHeight } from './sanitize-ios-keyboard-height.util';
+import { IosKeyboardService } from './ios-keyboard.service';
+import { CSS_VAR_KEYBOARD_HEIGHT } from './keyboard-css-vars.const';
+import { OverlayContainer } from '@angular/cdk/overlay';
+import { sanitizeSvgIconContent } from '../../util/sanitize-svg-icon.util';
+import { CustomThemeService, getRequiredThemeMode } from './custom-theme.service';
 
 interface NavigationBarPlugin {
   setColor(options: { color: string; style: 'LIGHT' | 'DARK' }): Promise<void>;
@@ -71,14 +80,47 @@ const NavigationBar = registerPlugin<NavigationBarPlugin>('NavigationBar');
 
 export type DarkModeCfg = 'dark' | 'light' | 'system';
 
-const CSS_VAR_KEYBOARD_HEIGHT = '--keyboard-height';
-const CSS_VAR_KEYBOARD_OVERLAY_OFFSET = '--keyboard-overlay-offset';
-const CSS_VAR_VISUAL_VIEWPORT_HEIGHT = '--visual-viewport-height';
 const CSS_VAR_SAFE_AREA_TOP = '--safe-area-inset-top';
 const CSS_VAR_SAFE_AREA_BOTTOM = '--safe-area-inset-bottom';
 const CSS_VAR_SAFE_AREA_LEFT = '--safe-area-inset-left';
 const CSS_VAR_SAFE_AREA_RIGHT = '--safe-area-inset-right';
-const VIEWPORT_RESIZE_EPSILON_PX = 1;
+const CSS_VAR_SYSTEM_SURFACE = '--system-surface';
+const DEFAULT_LIGHT_SYSTEM_SURFACE = '#f8f8f7';
+const DEFAULT_DARK_SYSTEM_SURFACE = '#131314';
+
+/**
+ * Resolve a CSS theme surface to the opaque hex format Android's Color parser
+ * accepts. Transparent, gradient, unresolved, and otherwise invalid values
+ * fall back to the matching Default-theme surface.
+ */
+export const resolveSystemSurfaceColor = (
+  rawColor: string,
+  isDarkMode: boolean,
+): string => {
+  const color = rawColor.trim();
+  const fallback = isDarkMode
+    ? DEFAULT_DARK_SYSTEM_SURFACE
+    : DEFAULT_LIGHT_SYSTEM_SURFACE;
+
+  if (/^#[\da-f]{6}$/i.test(color)) {
+    return color;
+  }
+  if (/^#[\da-f]{3}$/i.test(color)) {
+    return `#${[...color.slice(1)].map((digit) => `${digit}${digit}`).join('')}`;
+  }
+  const rgbMatch = color.match(
+    /^rgb\(\s*(\d{1,3})(?:\s*,\s*|\s+)(\d{1,3})(?:\s*,\s*|\s+)(\d{1,3})\s*\)$/i,
+  );
+  if (rgbMatch) {
+    const channels = rgbMatch.slice(1).map(Number);
+    if (channels.every((channel) => channel <= 255)) {
+      return `#${channels
+        .map((channel) => channel.toString(16).padStart(2, '0'))
+        .join('')}`;
+    }
+  }
+  return fallback;
+};
 
 /** The four wallpaper fields of the app-level (global) background config. */
 export type GlobalWallpaperCfg = Pick<
@@ -158,21 +200,13 @@ export class GlobalThemeService {
   private _imexMetaService = inject(ImexViewService);
   private _http = inject(HttpClient);
   private _platformService = inject(CapacitorPlatformService);
+  private _customThemeService = inject(CustomThemeService);
   private _environmentInjector = inject(EnvironmentInjector);
   private _destroyRef = inject(DestroyRef);
   private _inputIntentService = inject(InputIntentService);
+  private _iosKeyboardService = inject(IosKeyboardService);
+  private _overlayContainer = inject(OverlayContainer);
   private _hasInitialized = false;
-  private _keyboardListenerHandles: PluginListenerHandle[] = [];
-  private _focusinListener: ((event: FocusEvent) => void) | null = null;
-  private _visualViewportResizeListener: (() => void) | null = null;
-  private _iosKeyboardHeight = 0;
-  private _iosViewportHeightBeforeKeyboard = 0;
-  private _iosViewportChangeRaf: number | null = null;
-  // True only when the plugin reported an implausible keyboard frame (the clamp
-  // had to correct it). Gates the measured-viewport override so well-behaved
-  // keyboards keep their exact pre-existing behaviour (#8778).
-  private _iosKeyboardFrameUnreliable = false;
-
   private _isCustomWindowTitleBarEnabled(): boolean {
     // The main process (main-window.ts) force-disables the custom title bar on
     // GNOME+Wayland because the Window-Controls-Overlay won't render there.
@@ -268,6 +302,7 @@ export class GlobalThemeService {
       // This is here to make web page reloads on non-work-context pages at least usable
       this._setBackgroundTint(true);
       this._initIcons();
+      this._initRequiredThemeMode();
       this._initHandlersForInitialBodyClasses();
       this._initThemeWatchers();
 
@@ -286,6 +321,20 @@ export class GlobalThemeService {
     });
     // this._materialCssVarsService.setDarkTheme(true);
     // this._materialCssVarsService.setDarkTheme(false);
+  }
+
+  private _initRequiredThemeMode(): void {
+    const enforceActiveThemeMode = (): void => {
+      const requiredMode = getRequiredThemeMode(this._customThemeService.activeRef());
+      if (requiredMode && this.darkMode() !== requiredMode) {
+        this.darkMode.set(requiredMode);
+      }
+    };
+
+    // Effects run during change detection; enforce once synchronously so the
+    // cold-start stylesheet never waits a frame for its required body class.
+    enforceActiveThemeMode();
+    effect(enforceActiveThemeMode);
   }
 
   private _setColorTheme(theme: WorkContextThemeCfg): void {
@@ -382,12 +431,21 @@ export class GlobalThemeService {
     return this._registeredPluginIcons.has(iconName);
   }
 
+  /**
+   * `svgContent` comes from a plugin, so it is untrusted. `MatIconRegistry` parses the
+   * literal with `div.innerHTML`, which makes this the trust boundary for that sink.
+   */
   registerSvgIconFromContent(iconName: string, svgContent: string): void {
     // Plugin icon is already registered, skip
     if (this._registeredPluginIcons.has(iconName)) return;
+    const safeSvgContent = sanitizeSvgIconContent(svgContent);
+    if (!safeSvgContent) {
+      PluginLog.warn(`Skipping unsafe or invalid SVG icon: ${iconName}`);
+      return;
+    }
     this._matIconRegistry.addSvgIconLiteral(
       iconName,
-      this._domSanitizer.bypassSecurityTrustHtml(svgContent),
+      this._domSanitizer.bypassSecurityTrustHtml(safeSvgContent),
     );
     this._registeredPluginIcons.add(iconName);
   }
@@ -457,13 +515,23 @@ export class GlobalThemeService {
 
       if (this._platformService.isIOS()) {
         this.document.body.classList.add(BodyClass.isIOS);
-        this._initIOSKeyboardHandling();
+        this._iosKeyboardService.init();
+        lockViewportZoom(this.document);
 
         // Add iPad-specific class for tablet optimizations
         if (this._platformService.isIPad()) {
           this.document.body.classList.add(BodyClass.isIPad);
         }
       }
+    }
+
+    // Engine-level marker for the iOS focus-zoom workaround, set for web too:
+    // `isIOS` above is inside the isNative branch, so mobile Safari and the
+    // installed PWA never get it, yet they zoom exactly the same. Styles that
+    // must clear the 16px threshold key off THIS class (see
+    // styles/mixins/_ios-focus-zoom.scss).
+    if (this._platformService.isIOSWebKit()) {
+      this.document.body.classList.add(BodyClass.isIOSWebKit);
     }
 
     if (IS_ANDROID_WEB_VIEW) {
@@ -492,8 +560,7 @@ export class GlobalThemeService {
 
     // VisualViewport keyboard-height tracking covers every non-iOS touch
     // build: Capacitor Android, the legacy F-Droid build, and Android
-    // mobile-web. iOS uses _initIOSKeyboardHandling above; its Capacitor
-    // plugin already drives the same CSS variable and the two would race.
+    // mobile-web. iOS is handled entirely by IosKeyboardService above.
     if (IS_TOUCH_ONLY && !this._platformService.isIOS()) {
       this._initVisualViewportKeyboardTracking();
     }
@@ -606,191 +673,6 @@ export class GlobalThemeService {
   }
 
   /**
-   * Initialize iOS keyboard visibility tracking using Capacitor Keyboard plugin.
-   * Adds/removes CSS classes when keyboard shows/hides.
-   */
-  private _initIOSKeyboardHandling(): void {
-    // Hide the native iOS accessory bar (prev/next/Done) — no multi-field forms
-    // benefit from it, and Done is redundant with the system dismiss gesture.
-    Keyboard.setAccessoryBarVisible({ isVisible: false });
-    this._updateIOSKeyboardViewportVars();
-
-    if (window.visualViewport) {
-      this._visualViewportResizeListener = (): void => {
-        this._updateIOSKeyboardViewportVars();
-      };
-      window.visualViewport.addEventListener(
-        'resize',
-        this._visualViewportResizeListener,
-        { passive: true },
-      );
-    }
-
-    Keyboard.addListener('keyboardWillShow', (info: KeyboardInfo) => {
-      Log.log('iOS keyboard will show', info);
-      if (!this.document.body.classList.contains(BodyClass.isKeyboardVisible)) {
-        this._iosViewportHeightBeforeKeyboard = window.innerHeight;
-      }
-      // Some third-party keyboards (e.g. Sogou) report a bogus near-full-screen
-      // keyboard frame here; clamp it so it can't fling the fixed add-task bar
-      // to the top of the screen (#8778).
-      const referenceHeight = this._iosViewportHeightBeforeKeyboard || window.innerHeight;
-      const keyboardHeight = sanitizeIosKeyboardHeight(
-        info.keyboardHeight,
-        referenceHeight,
-      );
-      // Only a frame the clamp had to correct opts into the measured-viewport
-      // override in _updateIOSKeyboardViewportVars; well-behaved keyboards keep
-      // the exact pre-existing behaviour, so this cannot regress them.
-      this._iosKeyboardFrameUnreliable = keyboardHeight !== info.keyboardHeight;
-      this._iosKeyboardHeight = keyboardHeight;
-      this.document.body.classList.add(BodyClass.isKeyboardVisible);
-      // Set CSS variable for keyboard height to adjust layout
-      this.document.documentElement.style.setProperty(
-        CSS_VAR_KEYBOARD_HEIGHT,
-        `${keyboardHeight}px`,
-      );
-      this._updateIOSKeyboardViewportVars();
-    }).then((handle) => this._keyboardListenerHandles.push(handle));
-
-    // Use keyboardDidShow for scroll (after animation completes)
-    Keyboard.addListener('keyboardDidShow', () => {
-      this._updateIOSKeyboardViewportVars();
-      this._scrollActiveInputIntoView();
-    }).then((handle) => this._keyboardListenerHandles.push(handle));
-
-    Keyboard.addListener('keyboardWillHide', () => {
-      Log.log('iOS keyboard will hide');
-      this._iosKeyboardHeight = 0;
-      this._iosViewportHeightBeforeKeyboard = 0;
-      this._iosKeyboardFrameUnreliable = false;
-      this.document.body.classList.remove(BodyClass.isKeyboardVisible);
-      this.document.documentElement.style.setProperty(CSS_VAR_KEYBOARD_HEIGHT, '0px');
-      this.document.documentElement.style.setProperty(
-        CSS_VAR_KEYBOARD_OVERLAY_OFFSET,
-        '0px',
-      );
-      this._updateIOSKeyboardViewportVars();
-    }).then((handle) => this._keyboardListenerHandles.push(handle));
-
-    // Also handle focus changes while keyboard is already visible
-    this._focusinListener = (event: FocusEvent): void => {
-      const target = event.target as HTMLElement;
-      if (
-        this.document.body.classList.contains(BodyClass.isKeyboardVisible) &&
-        this._isInputElement(target)
-      ) {
-        // Small delay to let CSS padding apply, validate element is still focused
-        setTimeout(() => {
-          if (this.document.activeElement === target) {
-            this._scrollActiveInputIntoView();
-          }
-        }, 50);
-      }
-    };
-    this.document.addEventListener('focusin', this._focusinListener, { passive: true });
-
-    // Cleanup listeners on destroy
-    this._destroyRef.onDestroy(() => {
-      this._keyboardListenerHandles.forEach((handle) => handle.remove());
-      if (this._visualViewportResizeListener && window.visualViewport) {
-        window.visualViewport.removeEventListener(
-          'resize',
-          this._visualViewportResizeListener,
-        );
-      }
-      if (this._iosViewportChangeRaf !== null) {
-        window.cancelAnimationFrame(this._iosViewportChangeRaf);
-      }
-      if (this._focusinListener) {
-        this.document.removeEventListener('focusin', this._focusinListener);
-      }
-    });
-  }
-
-  private _updateIOSKeyboardViewportVars(): void {
-    const root = this.document.documentElement;
-    const visualViewportHeight = window.visualViewport?.height;
-    const baseHeight = this._iosViewportHeightBeforeKeyboard || window.innerHeight;
-    const isKeyboardVisible = this._iosKeyboardHeight > 0;
-    const isVisualViewportAlreadyResized = this._isVisualViewportResizedForKeyboard(
-      isKeyboardVisible,
-      baseHeight,
-      visualViewportHeight,
-    );
-    const height = isKeyboardVisible
-      ? this._getKeyboardAdjustedViewportHeight(baseHeight, visualViewportHeight)
-      : (visualViewportHeight ?? window.innerHeight);
-
-    root.style.setProperty(CSS_VAR_VISUAL_VIEWPORT_HEIGHT, `${Math.max(0, height)}px`);
-    root.style.setProperty(
-      CSS_VAR_KEYBOARD_OVERLAY_OFFSET,
-      `${isKeyboardVisible && !isVisualViewportAlreadyResized ? this._iosKeyboardHeight : 0}px`,
-    );
-
-    // For a keyboard whose reported frame was implausible, once the viewport has
-    // actually shrunk its measured obscured area (`baseHeight -
-    // visualViewportHeight`) is a far more reliable keyboard height than the
-    // bogus plugin frame (#8778), and is correct under both `resize: 'native'`
-    // and non-resizing modes. Correct `--keyboard-height` to the measurement
-    // (still clamped as a safety net). Well-behaved keyboards skip this entirely
-    // and keep the plugin value set in keyboardWillShow — no behaviour change.
-    if (
-      this._iosKeyboardFrameUnreliable &&
-      this._isVisualViewportResizedForKeyboard(
-        isKeyboardVisible,
-        baseHeight,
-        visualViewportHeight,
-      )
-    ) {
-      root.style.setProperty(
-        CSS_VAR_KEYBOARD_HEIGHT,
-        `${sanitizeIosKeyboardHeight(baseHeight - visualViewportHeight, baseHeight)}px`,
-      );
-    }
-    this._notifyIOSViewportChange();
-  }
-
-  private _getKeyboardAdjustedViewportHeight(
-    baseHeight: number,
-    visualViewportHeight?: number,
-  ): number {
-    const keyboardAdjustedHeight = baseHeight - this._iosKeyboardHeight;
-
-    if (
-      this._isVisualViewportResizedForKeyboard(true, baseHeight, visualViewportHeight)
-    ) {
-      return visualViewportHeight;
-    }
-
-    return keyboardAdjustedHeight;
-  }
-
-  private _isVisualViewportResizedForKeyboard(
-    isKeyboardVisible: boolean,
-    baseHeight: number,
-    visualViewportHeight?: number,
-  ): visualViewportHeight is number {
-    return (
-      isKeyboardVisible &&
-      visualViewportHeight !== undefined &&
-      visualViewportHeight < baseHeight - VIEWPORT_RESIZE_EPSILON_PX
-    );
-  }
-
-  private _notifyIOSViewportChange(): void {
-    if (this._iosViewportChangeRaf !== null) {
-      return;
-    }
-
-    this._iosViewportChangeRaf = window.requestAnimationFrame(() => {
-      this._iosViewportChangeRaf = null;
-      // Connected CDK overlays listen to viewport resize events via ViewportRuler.
-      window.dispatchEvent(new Event('resize'));
-    });
-  }
-
-  /**
    * Keyboard-height tracking via VisualViewport — the fallback path for any
    * non-iOS touch build (Capacitor Android, F-Droid, mobile-web).
    *
@@ -860,28 +742,6 @@ export class GlobalThemeService {
     });
   }
 
-  private _isInputElement(el: HTMLElement): boolean {
-    const tagName = el.tagName.toLowerCase();
-    return (
-      tagName === 'input' ||
-      tagName === 'textarea' ||
-      tagName === 'select' ||
-      el.isContentEditable
-    );
-  }
-
-  private _scrollActiveInputIntoView(): void {
-    const activeEl = this.document.activeElement as HTMLElement;
-    if (activeEl && this._isInputElement(activeEl)) {
-      // scrollIntoViewIfNeeded is non-standard but well-supported in iOS WebView
-      if ('scrollIntoViewIfNeeded' in activeEl) {
-        (activeEl as any).scrollIntoViewIfNeeded(true);
-      } else {
-        activeEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      }
-    }
-  }
-
   /**
    * Initialize mobile status bar styling.
    * Syncs status bar style with app dark/light mode on both iOS and Android.
@@ -926,54 +786,26 @@ export class GlobalThemeService {
       SafeArea.getSafeAreaInsets().then(({ insets }) => applyInsets(insets));
       SafeArea.addListener('safeAreaChanged', ({ insets }) => applyInsets(insets));
     }
-    this._patchCdkViewportForSafeArea();
-  }
-
-  /**
-   * Monkey-patch CDK's viewport rect calculation to include native mobile insets.
-   * This keeps connected overlays (menus, selects, autocomplete panels) above
-   * the safe areas and the iOS keyboard when the WebView does not shrink.
-   */
-  private _patchCdkViewportForSafeArea(): void {
-    const proto = FlexibleConnectedPositionStrategy.prototype as any;
-    const original = proto._getNarrowedViewportRect;
-    const doc = this.document;
-    proto._getNarrowedViewportRect = function (): {
-      top: number;
-      left: number;
-      right: number;
-      bottom: number;
-      width: number;
-      height: number;
-    } {
-      const rect = original.call(this);
-      const style = getComputedStyle(doc.documentElement);
-      const safeTop = parseInt(style.getPropertyValue(CSS_VAR_SAFE_AREA_TOP), 10) || 0;
-      const safeBottom =
-        parseInt(style.getPropertyValue(CSS_VAR_SAFE_AREA_BOTTOM), 10) || 0;
-      const keyboardOverlayOffset =
-        doc.body.classList.contains(BodyClass.isIOS) &&
-        doc.body.classList.contains(BodyClass.isKeyboardVisible)
-          ? parseInt(style.getPropertyValue(CSS_VAR_KEYBOARD_OVERLAY_OFFSET), 10) || 0
-          : 0;
-      const bottomInset = safeBottom + keyboardOverlayOffset;
-      return {
-        ...rect,
-        top: rect.top + safeTop,
-        bottom: rect.bottom - bottomInset,
-        height: rect.height - safeTop - bottomInset,
-      };
-    };
+    patchCdkViewportForSafeArea(
+      this.document,
+      this._overlayContainer.getContainerElement(),
+    );
   }
 
   private _initMobileStatusBar(): void {
     effect(() => {
       const isDark = this.isDarkTheme();
+      // Re-read computed tokens only after the loader has atomically swapped
+      // the stylesheet. Theme changes do not necessarily change dark mode.
+      this._customThemeService.appliedThemeVersion();
       StatusBar.setStyle({ style: isDark ? Style.Dark : Style.Light }).catch((err) => {
         Log.warn('Failed to set status bar style', err);
       });
       if (this._platformService.isAndroid()) {
-        const bgColor = isDark ? '#131314' : '#f8f8f7';
+        const bgColor = resolveSystemSurfaceColor(
+          getComputedStyle(this.document.body).getPropertyValue(CSS_VAR_SYSTEM_SURFACE),
+          isDark,
+        );
         // The @capawesome edge-to-edge plugin (which painted opaque bar overlays
         // via EdgeToEdge.set{Status,Navigation}BarColor) was removed in favour of
         // Capacitor's built-in SystemBars. SystemBars has NO bar-color API — the

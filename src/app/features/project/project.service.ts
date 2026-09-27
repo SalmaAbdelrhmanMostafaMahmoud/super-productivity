@@ -28,7 +28,6 @@ import {
   toggleHideFromMenu,
   unarchiveProject,
   updateProject,
-  updateProjectOrder,
 } from './store/project.actions';
 import { TaskSharedActions } from '../../root-store/meta/task-shared.actions';
 import { DEFAULT_PROJECT, INBOX_PROJECT } from './project.const';
@@ -48,12 +47,16 @@ import { sortByTitle } from '../../util/sort-by-title';
 import { Note } from '../note/note.model';
 import { selectNoteFeatureState } from '../note/store/note.reducer';
 import { addNote } from '../note/store/note.actions';
+import { Section } from '../section/section.model';
+import { addSection } from '../section/store/section.actions';
+import { selectSectionsByContextIdMap } from '../section/store/section.selectors';
 import { DialogConfirmComponent } from '../../ui/dialog-confirm/dialog-confirm.component';
 import { LOCAL_ACTIONS } from '../../util/local-actions.token';
 import { DateService } from '../../core/date/date.service';
 import { getDeadlineAutoPlanFields } from '../tasks/util/get-deadline-auto-plan-fields';
 import { MenuTreeService } from '../menu-tree/menu-tree.service';
 import { selectMenuTreeProjectTree } from '../menu-tree/store/menu-tree.selectors';
+import { TaskTimeSyncService } from '../tasks/task-time-sync.service';
 
 export interface ProjectCompletionInfo {
   topLevelTasks: Task[];
@@ -111,6 +114,7 @@ export class ProjectService {
   private readonly _actions$ = inject(LOCAL_ACTIONS);
   private readonly _timeTrackingService = inject(TimeTrackingService);
   private readonly _taskService = inject(TaskService);
+  private readonly _taskTimeSync = inject(TaskTimeSyncService);
   private readonly _translate = inject(TranslateService);
   private readonly _matDialog = inject(MatDialog);
   private readonly _dateService = inject(DateService);
@@ -246,6 +250,10 @@ export class ProjectService {
       const withSubTasks = await firstValueFrom(
         this._taskService.getByIdWithSubTaskData$(task.id),
       );
+      // Skip tasks that vanished from the store mid-loop (#9946).
+      if (!withSubTasks) {
+        continue;
+      }
       this._taskService.moveToProject(withSubTasks, INBOX_PROJECT.id);
       if (task.isDone) {
         this._taskService.setUnDone(task.id);
@@ -395,6 +403,7 @@ export class ProjectService {
       }
     });
     const allTaskIds = [...allParentTaskIds, ...subTaskIdsForProject];
+    allTaskIds.forEach((taskId) => this._taskTimeSync.clearOne(taskId));
     this._store$.dispatch(
       TaskSharedActions.deleteProject({
         projectId: project.id,
@@ -404,13 +413,18 @@ export class ProjectService {
     );
   }
 
-  update(projectId: string, changedFields: Partial<Project>): void {
+  update(
+    projectId: string,
+    changedFields: Partial<Project>,
+    isSkipSnack?: boolean,
+  ): void {
     this._store$.dispatch(
       updateProject({
         project: {
           id: projectId,
           changes: changedFields,
         },
+        isSkipSnack,
       }),
     );
   }
@@ -427,10 +441,6 @@ export class ProjectService {
 
   moveTaskToBacklog(taskId: string, projectId: string): void {
     this._store$.dispatch(moveProjectTaskToBacklogListAuto({ taskId, projectId }));
-  }
-
-  updateOrder(ids: string[]): void {
-    this._store$.dispatch(updateProjectOrder({ ids }));
   }
 
   async duplicateProject(templateProjectId: string): Promise<string> {
@@ -502,9 +512,16 @@ export class ProjectService {
     const newNoteIds = this._duplicateNotesToProject(notesToCopy, newProjectId);
     this.update(newProjectId, { noteIds: newNoteIds });
 
-    this._duplicateTasksToProject(parentTasks, newProjectId, false, taskState);
+    const sectionsMap = await firstValueFrom(
+      this._store$.select(selectSectionsByContextIdMap),
+    );
+    const sectionsToCopy = sectionsMap.get(templateProjectId) ?? [];
 
-    this._duplicateTasksToProject(backlogTasks, newProjectId, true, taskState);
+    const taskIdMap = new Map<string, string>();
+    this._duplicateTasksToProject(parentTasks, newProjectId, false, taskState, taskIdMap);
+    this._duplicateTasksToProject(backlogTasks, newProjectId, true, taskState, taskIdMap);
+
+    this._duplicateSectionsToProject(sectionsToCopy, newProjectId, taskIdMap);
 
     return newProjectId;
   }
@@ -514,6 +531,7 @@ export class ProjectService {
     newProjectId: string,
     isBacklog: boolean,
     taskState: TaskState,
+    taskIdMap: Map<string, string>,
   ): void {
     // For each parent task create a copy in the new project and then copy its subtasks
     for (const p of tasks) {
@@ -541,6 +559,7 @@ export class ProjectService {
         workContextType: WorkContextType.PROJECT,
         workContextId: newProjectId,
       });
+      taskIdMap.set(p.id, newParentTask.id);
 
       // dispatch addTask for the parent task
       this._store$.dispatch(
@@ -580,6 +599,7 @@ export class ProjectService {
             workContextType: WorkContextType.PROJECT,
             workContextId: newProjectId,
           });
+          taskIdMap.set(st.id, newSub.id);
 
           this._store$.dispatch(addSubTask({ task: newSub, parentId: newParentTask.id }));
         }
@@ -606,5 +626,30 @@ export class ProjectService {
       this._store$.dispatch(addNote({ note: newNote, isPreventFocus: true }));
     }
     return newNoteIds;
+  }
+
+  private _duplicateSectionsToProject(
+    sections: Section[],
+    newProjectId: string,
+    taskIdMap: Map<string, string>,
+  ): void {
+    for (const section of sections) {
+      const newTaskIds = section.taskIds
+        .map((id) => taskIdMap.get(id))
+        .filter((id): id is string => !!id);
+
+      this._store$.dispatch(
+        addSection({
+          section: {
+            id: nanoid(),
+            contextId: newProjectId,
+            contextType: WorkContextType.PROJECT,
+            title: section.title,
+            isExpanded: section.isExpanded,
+            taskIds: newTaskIds,
+          },
+        }),
+      );
+    }
   }
 }

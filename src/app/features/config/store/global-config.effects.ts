@@ -28,15 +28,17 @@ import { updateGlobalConfigSection } from './global-config.actions';
 import {
   selectConfigFeatureState,
   selectLocalizationConfig,
+  selectMiscConfig,
 } from './global-config.reducer';
 import { mapKeyboardConfigToQwerty } from '../keyboard-shortcut.util';
-import { AppFeaturesConfig, MiscConfig } from '../global-config.model';
-import { UserProfileService } from '../../user-profile/user-profile.service';
+import { MiscConfig } from '../global-config.model';
 import { AppStateActions } from '../../../root-store/app-state/app-state.actions';
 import { TaskSharedActions } from '../../../root-store/meta/task-shared.actions';
 import { selectAllTasks } from '../../tasks/store/task.selectors';
 import { normalizeStartOfNextDayConfig } from '../normalize-start-of-next-day-config';
 import { Log } from '../../../core/log';
+import { bulkApplyOperations } from '../../../op-log/apply/bulk-hydration.action';
+import { FULL_STATE_OP_TYPES } from '../../../op-log/core/operation.types';
 
 const LAYOUT_DETECTION_TIMEOUT_MS = 1000;
 
@@ -47,7 +49,6 @@ export class GlobalConfigEffects {
   private _dateService = inject(DateService);
   private _snackService = inject(SnackService);
   private _store = inject(Store);
-  private _userProfileService = inject(UserProfileService);
   private _keyboardLayoutService = inject(KeyboardLayoutService);
   private _isElectron = inject(IS_ELECTRON_TOKEN);
   private _isMac = inject(IS_MAC_TOKEN);
@@ -220,6 +221,34 @@ export class GlobalConfigEffects {
     ),
   );
 
+  // Bulk replay intentionally hides its inner actions from effects. Reconcile this
+  // local, non-persistent runtime state after reducers finish, but keep the persistent
+  // dueDay migration in the direct local-change effect above.
+  setStartOfNextDayDiffOnBulkApply = createEffect(() =>
+    this._actions$.pipe(
+      ofType(bulkApplyOperations),
+      filter(({ operations }) =>
+        operations.some(
+          (op) =>
+            (op.entityType === 'GLOBAL_CONFIG' && op.entityId === 'misc') ||
+            FULL_STATE_OP_TYPES.has(op.opType),
+        ),
+      ),
+      withLatestFrom(this._store.select(selectMiscConfig)),
+      map(([, misc]) => {
+        const normalizedMisc = normalizeStartOfNextDayConfig(misc);
+        this._dateService.setStartOfNextDayDiff(
+          normalizedMisc.startOfNextDayTime,
+          normalizedMisc.startOfNextDay,
+        );
+        return AppStateActions.setTodayString({
+          todayStr: this._dateService.todayStr(),
+          startOfNextDayDiffMs: this._dateService.getStartOfNextDayDiffMs(),
+        });
+      }),
+    ),
+  );
+
   notifyElectronAboutCfgChange = createEffect(
     () =>
       this._actions$.pipe(
@@ -243,59 +272,6 @@ export class GlobalConfigEffects {
           const cfg = appDataComplete.globalConfig || DEFAULT_GLOBAL_CONFIG;
           // Send initial settings to electron for overlay initialization
           window.ea.sendSettingsUpdate(cfg);
-        }),
-      ),
-    { dispatch: false },
-  );
-
-  // Handle user profiles being enabled/disabled
-  handleUserProfilesToggle = createEffect(
-    () =>
-      this._actions$.pipe(
-        ofType(updateGlobalConfigSection),
-        filter(({ sectionKey, sectionCfg }) => sectionKey === 'appFeatures'),
-        filter(
-          ({ sectionCfg }) =>
-            sectionCfg &&
-            (sectionCfg as AppFeaturesConfig).isEnableUserProfiles !== undefined,
-        ),
-        tap(({ sectionCfg }) => {
-          const isEnabled = (sectionCfg as AppFeaturesConfig).isEnableUserProfiles;
-          const wasEnabled =
-            typeof localStorage !== 'undefined' &&
-            localStorage.getItem('sp_user_profiles_enabled') === 'true';
-
-          if (isEnabled === wasEnabled) {
-            // No change, skip
-            return;
-          }
-
-          // Update localStorage flag for fast startup check
-          if (typeof localStorage !== 'undefined') {
-            if (isEnabled) {
-              localStorage.setItem('sp_user_profiles_enabled', 'true');
-
-              // When enabling for the first time, trigger migration
-              this._userProfileService
-                .migrateOnFirstEnable()
-                .then(() => {
-                  this._snackService.open({
-                    type: 'SUCCESS',
-                    msg: 'User profiles enabled. Reloading app...',
-                  });
-                  setTimeout(() => window.location.reload(), 1000);
-                })
-                .catch((err) => {
-                  Log.err('Failed to migrate user profiles:', err);
-                  this._snackService.open({
-                    type: 'ERROR',
-                    msg: 'Failed to enable user profiles. Please try again.',
-                  });
-                });
-            } else {
-              localStorage.removeItem('sp_user_profiles_enabled');
-            }
-          }
         }),
       ),
     { dispatch: false },

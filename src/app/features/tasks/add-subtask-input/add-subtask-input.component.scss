@@ -1,3 +1,5 @@
+@use '../../../../styles/globals' as *;
+
 :host {
   display: block;
   margin-top: var(--s-quarter);
@@ -17,15 +19,18 @@
   padding: 0 44px 0 var(--s2);
   border: 1px solid var(--extra-border-color);
   border-radius: var(--task-border-radius);
+  box-shadow: var(--whiteframe-shadow-4dp);
   outline: 0;
-  background: var(--sub-task-c-bg);
+  background: var(--bg-lightest);
   color: var(--text-color-most-intense);
   font-family: var(--font-primary-stack);
-  font-size: 14px;
+  // Renders in the task detail panel right next to tag-edit, so it hit the same
+  // iOS focus zoom (#9556). line-height stays 40px — only the glyphs grow.
+  @include noIosFocusZoom();
   line-height: 40px;
 
   &:focus {
-    border-color: var(--palette-primary-500);
+    border-color: var(--c-accent);
   }
 }
 

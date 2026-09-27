@@ -22,11 +22,13 @@ import { provideMockStore } from '@ngrx/store/testing';
 import { selectSyncConfig } from '../../features/config/store/global-config.reducer';
 import { selectEnabledIssueProviders } from '../../features/issue/store/issue-provider.selectors';
 import { RatePromptService } from '../../features/dialog-please-rate/rate-prompt.service';
+import { JiraElectronBridgeService } from '../../features/issue/providers/jira/jira-electron-bridge.service';
 
 describe('StartupService', () => {
   let service: StartupService;
   let pluginService: jasmine.SpyObj<PluginService>;
   let ratePromptService: jasmine.SpyObj<RatePromptService>;
+  let jiraElectronBridge: jasmine.SpyObj<JiraElectronBridgeService>;
 
   beforeEach(() => {
     // Mock localStorage
@@ -76,6 +78,9 @@ describe('StartupService', () => {
 
     const pluginServiceSpy = jasmine.createSpyObj('PluginService', ['initializePlugins']);
     pluginServiceSpy.initializePlugins.and.returnValue(Promise.resolve());
+    const jiraElectronBridgeSpy = jasmine.createSpyObj('JiraElectronBridgeService', [
+      'initialize',
+    ]);
 
     const syncWrapperServiceSpy = jasmine.createSpyObj('SyncWrapperService', [
       'isSyncInProgressSync',
@@ -128,6 +133,7 @@ describe('StartupService', () => {
         { provide: SnackService, useValue: snackServiceSpy },
         { provide: RatePromptService, useValue: ratePromptServiceSpy },
         { provide: PluginService, useValue: pluginServiceSpy },
+        { provide: JiraElectronBridgeService, useValue: jiraElectronBridgeSpy },
         { provide: SyncWrapperService, useValue: syncWrapperServiceSpy },
         { provide: BannerService, useValue: bannerServiceSpy },
         { provide: UiHelperService, useValue: uiHelperServiceSpy },
@@ -154,11 +160,19 @@ describe('StartupService', () => {
     ratePromptService = TestBed.inject(
       RatePromptService,
     ) as jasmine.SpyObj<RatePromptService>;
+    jiraElectronBridge = TestBed.inject(
+      JiraElectronBridgeService,
+    ) as jasmine.SpyObj<JiraElectronBridgeService>;
   });
 
   describe('init', () => {
     // Note: Full init() testing requires complex BroadcastChannel mocking
     // These tests cover the testable parts
+
+    it('claims the Jira Electron capability before deferred plugin initialization', () => {
+      expect(jiraElectronBridge.initialize).toHaveBeenCalledOnceWith();
+      expect(pluginService.initializePlugins).not.toHaveBeenCalled();
+    });
 
     it('should check for stray backups during initialization', fakeAsync(() => {
       // Mock BroadcastChannel to prevent multi-instance blocking
@@ -222,6 +236,59 @@ describe('StartupService', () => {
     });
   });
 
+  describe('raw rebuild recovery', () => {
+    const callRecoveryCheck = async (): Promise<void> => {
+      await (
+        service as unknown as {
+          _offerInterruptedRebuildRecoveryIfNeeded: () => Promise<void>;
+        }
+      )._offerInterruptedRebuildRecoveryIfNeeded();
+    };
+
+    it('should re-offer Undo after reload when a completed recovery token exists', async () => {
+      const opLogStore = jasmine.createSpyObj('OperationLogStoreService', [
+        'isRawRebuildIncomplete',
+        'loadRawRebuildRecovery',
+      ]);
+      opLogStore.isRawRebuildIncomplete.and.resolveTo(false);
+      opLogStore.loadRawRebuildRecovery.and.resolveTo({
+        backupId: 'backup-4242',
+        backupSavedAt: 4242,
+        completedAt: 5000,
+      });
+      const syncService = jasmine.createSpyObj('OperationLogSyncService', [
+        'offerInterruptedRebuildRecovery',
+      ]);
+      syncService.offerInterruptedRebuildRecovery.and.resolveTo();
+      Object.assign(service as object, {
+        _opLogStore: opLogStore,
+        _injector: { get: () => syncService },
+      });
+
+      await callRecoveryCheck();
+
+      expect(syncService.offerInterruptedRebuildRecovery).toHaveBeenCalled();
+    });
+
+    it('should not instantiate sync recovery when no marker exists', async () => {
+      const opLogStore = jasmine.createSpyObj('OperationLogStoreService', [
+        'isRawRebuildIncomplete',
+        'loadRawRebuildRecovery',
+      ]);
+      opLogStore.isRawRebuildIncomplete.and.resolveTo(false);
+      opLogStore.loadRawRebuildRecovery.and.resolveTo(null);
+      const get = jasmine.createSpy('get');
+      Object.assign(service as object, {
+        _opLogStore: opLogStore,
+        _injector: { get },
+      });
+
+      await callRecoveryCheck();
+
+      expect(get).not.toHaveBeenCalled();
+    });
+  });
+
   describe('_isTourLikelyToBeShown (private)', () => {
     it('should return false if IS_SKIP_TOUR is set', () => {
       (localStorage.getItem as jasmine.Spy).and.callFake((key: string) => {
@@ -234,40 +301,27 @@ describe('StartupService', () => {
       expect(result).toBe(false);
     });
 
+    // Spy on the prototype getter rather than defining an own property on
+    // `navigator`: an own property survives the test and shadows the prototype
+    // getter for every later spec that spies on it.
     it('should return false for NIGHTWATCH user agent', () => {
-      const originalUserAgent = navigator.userAgent;
-      Object.defineProperty(navigator, 'userAgent', {
-        value: 'NIGHTWATCH',
-        configurable: true,
-      });
+      spyOnProperty(Navigator.prototype, 'userAgent', 'get').and.returnValue(
+        'NIGHTWATCH',
+      );
 
       const result = (service as any)._isTourLikelyToBeShown();
 
       expect(result).toBe(false);
-
-      // Restore
-      Object.defineProperty(navigator, 'userAgent', {
-        value: originalUserAgent,
-        configurable: true,
-      });
     });
 
     it('should return false for PLAYWRIGHT user agent', () => {
-      const originalUserAgent = navigator.userAgent;
-      Object.defineProperty(navigator, 'userAgent', {
-        value: 'Something PLAYWRIGHT Something',
-        configurable: true,
-      });
+      spyOnProperty(Navigator.prototype, 'userAgent', 'get').and.returnValue(
+        'Something PLAYWRIGHT Something',
+      );
 
       const result = (service as any)._isTourLikelyToBeShown();
 
       expect(result).toBe(false);
-
-      // Restore
-      Object.defineProperty(navigator, 'userAgent', {
-        value: originalUserAgent,
-        configurable: true,
-      });
     });
 
     it('should return false when more than 2 projects exist', () => {
@@ -296,16 +350,21 @@ describe('StartupService', () => {
   });
 
   describe('_requestPersistence (private)', () => {
+    // Same reason as the user-agent stub above: defining `storage` on
+    // `navigator` itself leaks the mock into every later spec in the run.
+    const stubStorage = (storage: unknown): void => {
+      spyOnProperty(Navigator.prototype, 'storage', 'get').and.returnValue(
+        storage as StorageManager,
+      );
+    };
+
     it('should request persistent storage', fakeAsync(() => {
       const mockStorage = {
         persisted: jasmine.createSpy().and.returnValue(Promise.resolve(false)),
         persist: jasmine.createSpy().and.returnValue(Promise.resolve(true)),
         estimate: jasmine.createSpy(),
       };
-      Object.defineProperty(navigator, 'storage', {
-        value: mockStorage,
-        configurable: true,
-      });
+      stubStorage(mockStorage);
 
       (service as any)._requestPersistence();
       tick();
@@ -322,10 +381,7 @@ describe('StartupService', () => {
         persist: jasmine.createSpy(),
         estimate: jasmine.createSpy(),
       };
-      Object.defineProperty(navigator, 'storage', {
-        value: mockStorage,
-        configurable: true,
-      });
+      stubStorage(mockStorage);
 
       (service as any)._requestPersistence();
       tick();

@@ -42,6 +42,13 @@ export interface FileBasedSyncData<
   vectorClock: VectorClock;
 
   /**
+   * Clock of the last explicit snapshot replacement, whose history is not in
+   * recentOps. Preserve it through ordinary uploads and compaction. Optional:
+   * older readers ignore it and older writers may omit it (#9170).
+   */
+  snapshotBaseClock?: VectorClock;
+
+  /**
    * Timestamp of last successful sync (epoch ms).
    */
   lastModified: number;
@@ -97,6 +104,16 @@ export interface FileBasedSnapshotRef {
   vectorClock: VectorClock;
   /** Optional provider rev of the referenced snapshot file (best-effort). */
   rev?: string;
+  /**
+   * #9040: immutable, per-compaction snapshot filename this ops file was built
+   * against (e.g. `sync-state__7__9f3a1c8b0d2e4f6a.json` — `<syncVersion>__<random>`).
+   * Present on ops files written by post-#9040 clients. Readers MUST prefer it over
+   * the fixed `sync-state.json`: a concurrent compactor force-writes its own
+   * snapshot to a DIFFERENT immutable file, so the winning ops pointer can never be
+   * stranded by a clobbered `sync-state.json`. Optional for backward compatibility
+   * — when absent (older ops files), readers fall back to `sync-state.json`/`.bak`.
+   */
+  file?: string;
 }
 
 /**
@@ -111,11 +128,23 @@ export interface FileBasedOpsFile<
   syncVersion: number;
   schemaVersion: number;
   vectorClock: VectorClock;
+  /** Last explicit replacement clock; same meaning as FileBasedSyncData. */
+  snapshotBaseClock?: VectorClock;
   lastModified: number;
   clientId: string;
   recentOps: SyncFileCompactOp<TCompactOperation>[];
   oldestOpSyncVersion?: number;
   snapshotRef: FileBasedSnapshotRef;
+  /**
+   * Present only while converting a legacy v2 file. Readers must finish or
+   * retry the migration before treating this ops file as committed. Keeping
+   * the complete candidate ops payload in the commit-point file makes recovery
+   * possible after a crash on either side of the legacy tombstone write.
+   */
+  migration?: {
+    status: 'pending';
+    legacyRev: string;
+  };
 }
 
 /**
@@ -171,6 +200,11 @@ export const FILE_BASED_SYNC_CONSTANTS = {
   // old and new clients must agree on these names forever.
   OPS_BACKUP_FILE: 'sync-ops.json.bak',
   STATE_BACKUP_FILE: 'sync-state.json.bak',
+  // #9040: prefix for the immutable per-compaction snapshot files
+  // (`sync-state__<syncVersion>__<random>.json`). Distinct from the fixed
+  // `sync-state.json` (no `__`) so the two never collide. Remote-format surface:
+  // old and new clients must keep this stable forever.
+  STATE_GEN_FILE_PREFIX: 'sync-state__',
   SPLIT_FILE_VERSION: 3 as const,
   // Post-compaction RETAINED size for the split ops file (≈ MAX_RECENT_OPS/2).
   // NOTE: this is the trim target, NOT the trigger — a recompaction fires when the
@@ -182,19 +216,4 @@ export const FILE_BASED_SYNC_CONSTANTS = {
   SPLIT_TOMBSTONE_FORMAT: 'split' as const,
   SYNC_VERSION_STORAGE_KEY_PREFIX: 'FILE_SYNC_VERSION_',
   LEGACY_META_FILE: '__meta_',
-  // SPAP-9: when a seq-0 snapshot download has CONCURRENT vector clocks with the
-  // local client, attempt an entity-level last-write-wins merge of the remote
-  // recent ops instead of forcing the binary USE_LOCAL/USE_REMOTE conflict
-  // dialog.
-  //
-  // Default OFF (review follow-up): the merge only replays the capped `recentOps`
-  // buffer and never re-hydrates the compacted `snapshotState`, so a snapshot whose
-  // compacted base holds an entity this client never downloaded would silently drop
-  // that entity — turning a user-recoverable conflict dialog into permanent, global,
-  // undetectable data loss. `_tryConcurrentSnapshotMerge` now additionally refuses to
-  // merge unless the retained recentOps provably bridge the entire gap, but until that
-  // guard is validated by a real multi-client E2E harness (SPAP-34) we keep the
-  // feature opt-in and fall back to the conflict dialog. Flip to true only alongside
-  // that validation.
-  AUTO_MERGE_CONCURRENT_SNAPSHOT: false,
 } as const;

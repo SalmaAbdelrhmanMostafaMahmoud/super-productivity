@@ -21,11 +21,11 @@ import { TaskService } from '../task.service';
 
 /**
  * Why the inline draft input closed. `escape` is a keyboard cancel (the draft
- * is discarded and focus returns to the task row); `blur` means focus already
- * moved elsewhere, so any pending draft is committed and focus is not stolen
- * back.
+ * is discarded and focus returns to the task row); `prev` and `next` continue
+ * keyboard navigation from an empty input; `blur` means focus already moved
+ * elsewhere with nothing left pending, so focus is not stolen back.
  */
-export type AddSubtaskInputCloseReason = 'escape' | 'blur';
+export type AddSubtaskInputCloseReason = 'escape' | 'blur' | 'prev' | 'next';
 
 @Component({
   selector: 'add-subtask-input',
@@ -69,6 +69,20 @@ export class AddSubtaskInputComponent {
     }
 
     if (
+      (ev.key === 'ArrowUp' || ev.key === 'ArrowDown') &&
+      !ev.isComposing &&
+      !ev.ctrlKey &&
+      !ev.metaKey &&
+      !ev.altKey &&
+      !ev.shiftKey &&
+      !this._liveTitle()
+    ) {
+      ev.preventDefault();
+      this._close(ev.key === 'ArrowUp' ? 'prev' : 'next');
+      return;
+    }
+
+    if (
       ev.key === 'Enter' &&
       !ev.repeat &&
       !ev.isComposing &&
@@ -90,14 +104,21 @@ export class AddSubtaskInputComponent {
     // On touch, the natural "done" gesture is tapping away, and the soft-keyboard
     // Enter is unreliable (several IME/WebView combos, e.g. GrapheneOS/Vanadium,
     // deliver it as a composing keydown that onKeydown ignores) with no
-    // tab-to-button, so blur must save the draft (#8791/#8856). On desktop, Enter
-    // and the submit button are reliable, so blur cancels — the long-standing
-    // behaviour — rather than silently creating a task on click-away, and a user
-    // can move to the button without the draft being committed out from under
-    // them. Escape always discards: it sets _isClosedWithoutSubmit, so its
-    // trailing blur is skipped by the guard above.
+    // tab-to-button, so blur must save the draft (#8791/#8856).
     if (this._shouldCommitOnBlur()) {
       this._addSubtaskFromInput();
+      this._close('blur');
+      return;
+    }
+
+    // On desktop, Enter and the submit button are the reliable commit paths, so
+    // blur must not silently create a task. But it must not throw the text away
+    // either: a draft with text stays open (unfocused) so clicking elsewhere and
+    // coming back keeps what was typed. Only an untouched/empty draft is
+    // dismissed by clicking away. Escape always discards: it sets
+    // _isClosedWithoutSubmit, so its trailing blur is skipped by the guard above.
+    if (this._liveTitle()) {
+      return;
     }
     this._close('blur');
   }
@@ -137,7 +158,7 @@ export class AddSubtaskInputComponent {
   }
 
   /**
-   * Add a sub-task from the current input text; returns whether one was added.
+   * The trimmed text currently in the field.
    *
    * Reads the live DOM value rather than the titleDraft signal: Angular's
    * DefaultValueAccessor buffers ngModelChange during IME / predictive-text
@@ -147,9 +168,14 @@ export class AddSubtaskInputComponent {
    * always holds the current text. The signal is a defensive fallback for the
    * impossible case of inputEl being unresolved.
    */
+  private _liveTitle(): string {
+    return (this.inputEl()?.nativeElement.value ?? this.titleDraft()).trim();
+  }
+
+  /** Add a sub-task from the current input text; returns whether one was added. */
   private _addSubtaskFromInput(): boolean {
     const inputEl = this.inputEl()?.nativeElement;
-    const title = (inputEl?.value ?? this.titleDraft()).trim();
+    const title = this._liveTitle();
     if (!title) {
       return false;
     }

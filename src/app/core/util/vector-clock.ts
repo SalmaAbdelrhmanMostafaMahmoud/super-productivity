@@ -171,6 +171,7 @@ export const incrementVectorClock = (
   // Log for debugging
   OpLog.verbose('incrementVectorClock', {
     clientId,
+    // eslint-disable-next-line local-rules/no-user-content-in-logs -- grandfathered log baseline (2026-09), not yet triaged
     currentValue,
     allClients: Object.keys(newClock),
   });
@@ -181,6 +182,7 @@ export const incrementVectorClock = (
   if (currentValue >= Number.MAX_SAFE_INTEGER - 1000) {
     OpLog.critical('Vector clock component overflow detected', {
       clientId,
+      // eslint-disable-next-line local-rules/no-user-content-in-logs -- grandfathered log baseline (2026-09), not yet triaged
       currentValue,
     });
     throw new Error(
@@ -270,6 +272,7 @@ export const hasVectorClockChanges = (
     if (refVal > 0 && !(clientId in current!)) {
       OpLog.warn('Vector clock change detected: client missing from current', {
         clientId,
+        // eslint-disable-next-line local-rules/no-user-content-in-logs -- grandfathered log baseline (2026-09), not yet triaged
         refValue: refVal,
         currentClock: vectorClockToString(current),
         referenceClock: vectorClockToString(reference),
@@ -295,19 +298,21 @@ export const vectorClockPruned$ = new Subject<{
  * Wraps the shared implementation from @sp/sync-core with client-side logging.
  *
  * @param clock The vector clock to limit
- * @param currentClientId The current client's ID (always preserved)
+ * @param preserveClientIds Client IDs to always keep when present — the current
+ *   client, plus the latest full-state import author so post-import ops keep
+ *   proving causal knowledge of the import (#9096)
  * @returns A vector clock with at most MAX_VECTOR_CLOCK_SIZE entries
  */
 export const limitVectorClockSize = (
   clock: VectorClock,
-  currentClientId: string,
+  preserveClientIds: string[],
 ): VectorClock => {
   const entries = Object.entries(clock);
   if (entries.length <= MAX_VECTOR_CLOCK_SIZE) {
     return clock;
   }
 
-  const limited = sharedLimitVectorClockSize(clock, [currentClientId]);
+  const limited = sharedLimitVectorClockSize(clock, preserveClientIds);
   const prunedIds = Object.keys(clock).filter((id) => !(id in limited));
 
   // WARN (not info): pruning is meant to be rare, so when it fires it is worth
@@ -318,7 +323,7 @@ export const limitVectorClockSize = (
   OpLog.warn('Vector clock pruning triggered', {
     originalSize: entries.length,
     maxSize: MAX_VECTOR_CLOCK_SIZE,
-    currentClientId,
+    preserveClientIds,
     prunedCount: prunedIds.length,
     prunedIds,
     survivingIds: Object.keys(limited),

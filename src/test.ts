@@ -24,6 +24,8 @@
 import 'fake-indexeddb/auto';
 import { IDBFactory } from 'fake-indexeddb';
 import { asyncScheduler } from 'rxjs';
+import { clearDeferredActions } from './app/op-log/capture/operation-capture.meta-reducer';
+import { _resetDevErrorState } from './app/util/dev-error';
 
 import { getTestBed, TestBed } from '@angular/core/testing';
 import {
@@ -101,6 +103,24 @@ beforeEach(() => {
     configurable: true,
     writable: true,
   });
+
+  // The deferred-action buffer is module-level state shared by every spec in
+  // the Karma context. Actions left in it leak into later spec FILES, where
+  // the phantom-change guard (#8751) reads it and silently skips compaction
+  // and snapshot saves — an order-dependent failure that passes standalone.
+  clearDeferredActions();
+
+  // The dialog spies below are created once at module load, so reset their
+  // call history before every spec to prevent assertions from passing on a
+  // stale call from an unrelated test. Re-arm devError's alert latch as well
+  // so legitimate alerts remain observable regardless of spec order.
+  if (jasmine.isSpy(window.alert)) {
+    (window.alert as jasmine.Spy).calls.reset();
+  }
+  if (jasmine.isSpy(window.confirm)) {
+    (window.confirm as jasmine.Spy).calls.reset();
+  }
+  _resetDevErrorState();
 });
 
 // Mock browser dialogs globally for tests
@@ -112,6 +132,21 @@ if (!(window.alert as jasmine.Spy).and) {
 if (!(window.confirm as jasmine.Spy).and) {
   window.confirm = jasmine.createSpy('confirm').and.returnValue(true);
 }
+
+// Neutralize file-saving clicks. `download()` (src/app/util/download.ts) saves a
+// file by creating an `<a download>` and clicking it, so any spec that reaches a
+// download path writes a real file into the browser's download directory — the
+// user's ~/Downloads on a dev machine. Whether the browser honours it depends on
+// the Chrome version (headless Chrome <= 150 wrote the file, 151 does not), so
+// the leak is silent and comes back with a browser update rather than a code
+// change. Anchor clicks without a `download` attribute keep their real behaviour.
+const originalAnchorClick = HTMLAnchorElement.prototype.click;
+HTMLAnchorElement.prototype.click = function (this: HTMLAnchorElement): void {
+  if (this.hasAttribute('download')) {
+    return;
+  }
+  originalAnchorClick.call(this);
+};
 
 // Configure the TestBed providers globally
 const originalConfigureTestingModule = TestBed.configureTestingModule;

@@ -40,7 +40,7 @@ export interface OpLogDbSchema {
 }
 
 /**
- * Current `SUP_OPS` schema, mirroring db-upgrade.ts (currently v7).
+ * Current `SUP_OPS` schema, mirroring db-upgrade.ts.
  *
  * `name`/`version` are reused from `db-keys.const.ts` (not re-literaled) so the
  * adapter opens at exactly the version `runDbUpgrade` migrates to — a future
@@ -75,7 +75,6 @@ export const OP_LOG_DB_SCHEMA: OpLogDbSchema = {
     { name: STORE_NAMES.VECTOR_CLOCK },
     { name: STORE_NAMES.ARCHIVE_YOUNG, keyPath: 'id' },
     { name: STORE_NAMES.ARCHIVE_OLD, keyPath: 'id' },
-    { name: STORE_NAMES.PROFILE_DATA, keyPath: 'id' },
     // keyless singleton: clientId stored under SINGLETON_KEY
     { name: STORE_NAMES.CLIENT_ID },
     // keyless singleton metadata records, written with explicit keys

@@ -8,22 +8,35 @@ import {
 import { ScheduleEvent } from '../schedule.model';
 import { ScheduleEventComponent } from '../schedule-event/schedule-event.component';
 import { safeFormatDate } from 'src/app/util/safe-format-date';
-import { T } from '../../../t.const';
 import { ScheduleService } from '../schedule.service';
 import { DateTimeFormatService } from 'src/app/core/date-time-format/date-time-format.service';
 import { parseDbDateStr } from 'src/app/util/parse-db-date-str';
+import { TranslatePipe, TranslateService, TranslateStore } from '@ngx-translate/core';
+import { getPluralKey } from '../../../util/get-plural-key';
+
+// `grid-template-rows` repeats `var(--nr-of-weeks)`, which otherwise resolves to
+// the static 6 declared on `schedule`. At 5 weeks that leaves a sixth, empty row
+// and sizes every row 1/6 instead of 1/5 (#9584).
+const HOST_WEEKS_VAR = '[style.--nr-of-weeks]' as const;
+
+const HOST_BINDINGS = {
+  [HOST_WEEKS_VAR]: 'weeksToShow()',
+} as const;
 
 @Component({
   selector: 'schedule-month',
-  imports: [ScheduleEventComponent],
+  imports: [ScheduleEventComponent, TranslatePipe],
   templateUrl: './schedule-month.component.html',
   styleUrl: './schedule-month.component.scss',
   changeDetection: ChangeDetectionStrategy.OnPush,
   standalone: true,
+  host: HOST_BINDINGS,
 })
 export class ScheduleMonthComponent {
   private _scheduleService = inject(ScheduleService);
   private _dateTimeFormatService = inject(DateTimeFormatService);
+  private _translateService = inject(TranslateService);
+  private _translateStore = inject(TranslateStore);
 
   readonly events = input<ScheduleEvent[] | null>([]);
   readonly daysToShow = input<string[]>([]);
@@ -34,6 +47,11 @@ export class ScheduleMonthComponent {
   readonly weekdayHeaders = computed(() => {
     const firstDay = this.firstDayOfWeek();
     const headers: string[] = [];
+    const isoTextLocale = this._dateTimeFormatService.isoTextLocale();
+    const formatter = isoTextLocale
+      ? new Intl.DateTimeFormat(isoTextLocale, { weekday: 'short' })
+      : null;
+    const locale = this._dateTimeFormatService.currentLocale();
 
     // Create a date for each day of week (using a week starting on Sunday)
     // January 2, 2000 was a Sunday
@@ -43,9 +61,8 @@ export class ScheduleMonthComponent {
       const dayIndex = (firstDay + i) % 7;
       const date = new Date(sundayDate);
       date.setDate(sundayDate.getDate() + dayIndex);
-      // 'EEE' format gives abbreviated day name (e.g., 'Mon', 'Tue')
       headers.push(
-        safeFormatDate(date, 'EEE', this._dateTimeFormatService.currentLocale()),
+        formatter ? formatter.format(date) : safeFormatDate(date, 'EEE', locale),
       );
     }
 
@@ -77,8 +94,6 @@ export class ScheduleMonthComponent {
     return parseDbDateStr(days[middleIndex]);
   });
 
-  T: typeof T = T;
-
   getDayClass(day: string): string {
     return this._scheduleService.getDayClass(day, this.referenceMonth());
   }
@@ -93,6 +108,15 @@ export class ScheduleMonthComponent {
 
   getEventsForDay(day: string): ScheduleEvent[] {
     return this._scheduleService.getEventsForDay(day, this.events() || []);
+  }
+
+  getMoreEventsKey(count: number): string {
+    return getPluralKey(
+      this._translateService,
+      this._translateStore,
+      count,
+      'F.SCHEDULE.MORE_EVENTS',
+    );
   }
 
   getEventDayStr(ev: ScheduleEvent): string | null {
